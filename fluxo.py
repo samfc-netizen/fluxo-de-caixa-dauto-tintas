@@ -169,97 +169,136 @@ def _data_saldo(valor: object, ano: int, mes_padrao: int) -> pd.Timestamp:
         return pd.NaT
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def baixar_planilha_saldos() -> bytes:
-    resposta = requests.get(PLANILHA_SALDOS_URL, timeout=30)
+@st.cache_data(ttl=60, show_spinner=False)
+def baixar_aba_saldos(nome_aba: str) -> pd.DataFrame:
+    """Lê ao vivo o intervalo A4:L31 de uma aba do Google Sheets."""
+    url = f"https://docs.google.com/spreadsheets/d/{PLANILHA_SALDOS_ID}/gviz/tq"
+    resposta = requests.get(
+        url,
+        params={
+            "tqx": "out:csv",
+            "sheet": nome_aba,
+            "range": "A4:L31",
+            "_": str(pd.Timestamp.now().value),  # evita resposta antiga de proxy/CDN
+        },
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=45,
+        allow_redirects=True,
+    )
     resposta.raise_for_status()
-    if not resposta.content:
-        raise ValueError("A planilha de saldos foi baixada sem conteúdo.")
-    return resposta.content
+
+    conteudo = resposta.content
+    tipo = resposta.headers.get("Content-Type", "").lower()
+    inicio = conteudo[:250].decode("utf-8", errors="ignore").lower()
+    if not conteudo:
+        raise ValueError(f"A aba {nome_aba} retornou conteúdo vazio.")
+    if "text/html" in tipo or "<html" in inicio or "<!doctype" in inicio:
+        raise PermissionError(
+            "O Google retornou uma página HTML em vez dos dados da planilha. "
+            "Confirme o compartilhamento por link e se o arquivo é uma Planilha Google."
+        )
+
+    try:
+        quadro = pd.read_csv(io.BytesIO(conteudo), header=None, dtype=str)
+    except Exception as exc:
+        raise ValueError(f"Não foi possível interpretar a aba {nome_aba}: {exc}") from exc
+
+    # O gviz pode omitir colunas vazias no fim. Garante A:L.
+    quadro = quadro.reindex(columns=range(12))
+    return quadro
+
+
+def _numero_br_saldo(valor: object) -> float | None:
+    """Converte números e valores monetários brasileiros vindos do Google Sheets."""
+    if valor is None or (isinstance(valor, float) and pd.isna(valor)):
+        return None
+    if isinstance(valor, (int, float, np.number)):
+        return float(valor)
+
+    texto = str(valor).strip()
+    if not texto:
+        return None
+
+    negativo = texto.startswith("(") and texto.endswith(")")
+    texto = texto.replace("R$", "").replace(" ", "").replace("\u00a0", "")
+    texto = texto.replace("(", "").replace(")", "")
+
+    # Padrão brasileiro: 1.234.567,89
+    if "," in texto:
+        texto = texto.replace(".", "").replace(",", ".")
+    else:
+        # Sem vírgula: mantém ponto como decimal quando houver apenas um.
+        if texto.count(".") > 1:
+            texto = texto.replace(".", "")
+
+    texto = re.sub(r"[^0-9.\-]", "", texto)
+    if texto in {"", "-", ".", "-."}:
+        return None
+    try:
+        numero = float(texto)
+        return -numero if negativo else numero
+    except ValueError:
+        return None
 
 
 def buscar_saldo_drive(data_referencia: date | None = None) -> dict:
     """
-    Busca o saldo mais recente exclusivamente no quadro diário de cada aba mensal.
-
-    Regras:
-    - Data: coluna A, linhas 4 a 31.
-    - Saldo: coluna L, na mesma linha da data.
-    - Percorre todas as abas mensais existentes.
-    - Considera somente datas até a data de referência.
-    - Ignora linhas sem data, sem saldo e saldos zerados, pois normalmente
-      representam dias ainda não atualizados na planilha.
-    - Retorna o registro de maior data; em empate, usa a linha mais baixa.
+    Consulta ao vivo A4:L31 das abas mensais e retorna o saldo da data mais
+    recente preenchida até hoje. A data está em A e o saldo na mesma linha em L.
     """
     referencia = data_referencia or date.today()
-    arquivo = baixar_planilha_saldos()
-    excel = pd.ExcelFile(io.BytesIO(arquivo), engine="openpyxl")
-
-    # Relaciona os nomes reais das abas, tolerando espaços, caixa e acentos.
-    abas_reais = {norm_text(nome): nome for nome in excel.sheet_names}
     registros: list[dict] = []
+    erros: list[str] = []
 
-    for mes_num, nome_padrao in MESES_PLANILHA.items():
-        nome_real = abas_reais.get(norm_text(nome_padrao))
-        if not nome_real:
+    for mes_num, nome_aba in MESES_PLANILHA.items():
+        try:
+            quadro = baixar_aba_saldos(nome_aba)
+        except Exception as exc:
+            erros.append(f"{nome_aba}: {exc}")
             continue
 
-        bruto = pd.read_excel(
-            excel,
-            sheet_name=nome_real,
-            header=None,
-            engine="openpyxl",
-        )
+        # A resposta já corresponde exatamente às linhas 4 a 31.
+        for posicao, linha in quadro.iterrows():
+            valor_data = linha.iloc[0] if len(linha) > 0 else None
+            valor_saldo_original = linha.iloc[11] if len(linha) > 11 else None
 
-        # É necessário existir pelo menos até a coluna L.
-        if bruto.shape[1] < 12:
-            continue
+            data_linha = _data_saldo(valor_data, referencia.year, mes_num)
+            saldo_linha = _numero_br_saldo(valor_saldo_original)
 
-        # Excel A4:L31 corresponde, no pandas, aos índices 3:31.
-        limite_final = min(31, len(bruto))
-        quadro = bruto.iloc[3:limite_final, [0, 11]].copy()
-        quadro.columns = ["Data", "Saldo"]
-        quadro["Linha"] = quadro.index + 1  # número real da linha no Excel
-        quadro["Aba"] = nome_real
+            # "Preenchida" significa que ambas as células possuem valor válido.
+            if pd.isna(data_linha) or saldo_linha is None:
+                continue
+            if pd.Timestamp(data_linha).date() > referencia:
+                continue
+            if pd.Timestamp(data_linha).year != referencia.year:
+                continue
 
-        quadro["Data"] = quadro["Data"].apply(
-            lambda valor: _data_saldo(valor, referencia.year, mes_num)
-        )
-        quadro["Saldo"] = pd.to_numeric(quadro["Saldo"], errors="coerce")
-
-        quadro = quadro.dropna(subset=["Data", "Saldo"])
-        quadro = quadro[
-            (quadro["Data"].dt.date <= referencia)
-            & (quadro["Data"].dt.year == referencia.year)
-            & (quadro["Saldo"] != 0)
-        ]
-
-        for _, linha in quadro.iterrows():
             registros.append(
                 {
-                    "Data": pd.Timestamp(linha["Data"]),
-                    "Saldo": float(linha["Saldo"]),
-                    "Aba": str(linha["Aba"]),
-                    "Linha": int(linha["Linha"]),
+                    "Data": pd.Timestamp(data_linha).normalize(),
+                    "Saldo": float(saldo_linha),
+                    "Aba": nome_aba,
+                    "Linha": int(posicao) + 4,
                 }
             )
 
     if not registros:
+        detalhe = " | ".join(erros[:4])
         raise ValueError(
-            "Nenhum saldo válido foi encontrado nas células A4:A31 e L4:L31 "
-            f"até {referencia:%d/%m/%Y}."
+            "Nenhum saldo válido foi encontrado ao vivo em A4:A31 e L4:L31. "
+            + (f"Diagnóstico: {detalhe}" if detalhe else "")
         )
 
-    base = pd.DataFrame(registros).sort_values(
-        ["Data", "Linha"], ascending=[True, True]
-    )
+    base = pd.DataFrame(registros)
+    # Maior data; em empate, prevalece a linha mais baixa da aba.
+    base = base.sort_values(["Data", "Linha"], ascending=[True, True])
     ultimo = base.iloc[-1]
 
     return {
         "saldo": float(ultimo["Saldo"]),
         "data_saldo": pd.Timestamp(ultimo["Data"]).date(),
         "data_referencia": referencia,
-        "origem": "Último saldo preenchido no quadro diário A4:L31",
+        "origem": "Consulta ao vivo no Google Sheets · intervalo A4:L31",
         "aba": str(ultimo["Aba"]),
         "linha": int(ultimo["Linha"]),
     }
@@ -518,7 +557,7 @@ with st.sidebar:
     st.markdown("### Saldo bancário")
     atualizar_saldo = st.button("↻ Atualizar saldo agora", use_container_width=True)
     if atualizar_saldo:
-        baixar_planilha_saldos.clear()
+        baixar_aba_saldos.clear()
 
     try:
         resultado_saldo = buscar_saldo_drive()
