@@ -131,12 +131,12 @@ st.markdown(
 
 PLANILHA_SALDOS_ID = "1NFHtHLaBdzukM0JltkzEExro8zZj1ktD"
 PLANILHA_SALDOS_LINK = (
-    f"https://docs.google.com/spreadsheets/d/{PLANILHA_SALDOS_ID}/edit?usp=sharing"
+    f"https://docs.google.com/spreadsheets/d/{PLANILHA_SALDOS_ID}/edit"
 )
-PLANILHA_SALDOS_URLS = [
-    f"https://docs.google.com/spreadsheets/d/{PLANILHA_SALDOS_ID}/export?format=xlsx",
-    f"https://docs.google.com/spreadsheets/d/{PLANILHA_SALDOS_ID}/export?format=xlsx&id={PLANILHA_SALDOS_ID}",
-]
+PLANILHA_SALDOS_URL = (
+    f"https://docs.google.com/spreadsheets/d/{PLANILHA_SALDOS_ID}/export"
+    f"?format=xlsx&id={PLANILHA_SALDOS_ID}"
+)
 
 MESES_PLANILHA = {
     1: "JANEIRO", 2: "FEVEREIRO", 3: "MARÇO", 4: "ABRIL",
@@ -151,8 +151,14 @@ MESES_TEXTO = {
 }
 
 
+def _normalizar_nome_aba(nome: object) -> str:
+    texto = "" if nome is None else str(nome)
+    texto = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^A-Z]", "", texto.upper())
+
+
 def _data_saldo(valor: object, ano: int, mes_padrao: int) -> pd.Timestamp:
-    """Converte datas reais do Excel e textos como '30 DE JULHO'."""
+    """Converte datas do Excel e textos como '03 DE AGOSTO'."""
     if isinstance(valor, (pd.Timestamp, date)):
         return pd.Timestamp(valor).normalize()
 
@@ -161,7 +167,7 @@ def _data_saldo(valor: object, ano: int, mes_padrao: int) -> pd.Timestamp:
         return pd.Timestamp(convertido).normalize()
 
     texto = norm_text(valor)
-    match = re.search(r"(\d{1,2})\s+DE\s+([A-Z]+)", texto)
+    match = re.search(r"(\d{1,2})\s+(?:DE\s+)?([A-Z]+)", texto)
     if not match:
         return pd.NaT
 
@@ -173,117 +179,105 @@ def _data_saldo(valor: object, ano: int, mes_padrao: int) -> pd.Timestamp:
         return pd.NaT
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
 def baixar_planilha_saldos() -> bytes:
-    """Baixa a planilha pública e valida se a resposta é realmente um XLSX."""
     headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,*/*",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
         "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     }
-    erros: list[str] = []
-
-    for url in PLANILHA_SALDOS_URLS:
-        try:
-            resposta = requests.get(url, headers=headers, timeout=45, allow_redirects=True)
-            resposta.raise_for_status()
-            conteudo = resposta.content
-            content_type = (resposta.headers.get("Content-Type") or "").lower()
-
-            # Arquivos XLSX são ZIPs e começam normalmente com PK.
-            if conteudo[:2] != b"PK":
-                if "text/html" in content_type or conteudo.lstrip().startswith(b"<"):
-                    raise ValueError(
-                        "O Google retornou uma página de login/permissão em vez do arquivo XLSX. "
-                        "Na planilha, configure Compartilhar → Acesso geral → Qualquer pessoa com o link → Leitor."
-                    )
-                raise ValueError(
-                    f"O conteúdo recebido não é um XLSX válido (tipo: {content_type or 'não informado'})."
-                )
-
-            return conteudo
-        except Exception as exc:
-            erros.append(str(exc))
-
-    raise RuntimeError(" | ".join(erros) or "Não foi possível baixar a planilha de saldos.")
+    resposta = requests.get(
+        PLANILHA_SALDOS_URL,
+        headers=headers,
+        params={"_ts": int(pd.Timestamp.now().timestamp())},
+        timeout=60,
+        allow_redirects=True,
+    )
+    resposta.raise_for_status()
+    conteudo = resposta.content
+    if not conteudo:
+        raise ValueError("A planilha de saldos foi baixada sem conteúdo.")
+    if not conteudo.startswith(b"PK"):
+        tipo = resposta.headers.get("Content-Type", "não informado")
+        raise ValueError(
+            "O Google não devolveu um arquivo XLSX válido. "
+            f"Tipo recebido: {tipo}. Confirme que o link permite acesso sem login."
+        )
+    return conteudo
 
 
 def buscar_saldo_drive(data_referencia: date | None = None) -> dict:
     """
-    Percorre todas as abas mensais e retorna o último saldo preenchido.
-
-    Regras:
-    - lê a data na coluna A e o saldo na coluna L;
-    - ignora cabeçalhos, linhas vazias e saldos zerados;
-    - procura em JANEIRO...DEZEMBRO, sem parar no mês anterior;
-    - entre os registros até a data vigente, usa a data mais recente;
-    - se houver duplicidade na mesma data, usa a última linha física preenchida.
+    Percorre todas as abas mensais e usa a última linha física preenchida
+    com data válida na coluna A e saldo válido na coluna L.
     """
     referencia = data_referencia or date.today()
     arquivo = baixar_planilha_saldos()
+    excel = pd.ExcelFile(io.BytesIO(arquivo), engine="openpyxl")
 
-    try:
-        excel = pd.ExcelFile(io.BytesIO(arquivo), engine="openpyxl")
-    except Exception as exc:
-        raise ValueError(f"O arquivo baixado não pôde ser aberto como Excel: {exc}") from exc
+    # Aceita diferenças de caixa, acentos e espaços: AGOSTO, Agosto, AGOSTO  etc.
+    abas_disponiveis = {
+        _normalizar_nome_aba(nome): nome for nome in excel.sheet_names
+    }
 
-    abas_normalizadas = {norm_text(nome): nome for nome in excel.sheet_names}
-    registros: list[pd.DataFrame] = []
+    candidatos: list[dict] = []
+    abas_lidas: list[str] = []
 
-    for mes_num, aba_esperada in MESES_PLANILHA.items():
-        aba_real = abas_normalizadas.get(norm_text(aba_esperada))
+    for mes_num, nome_padrao in MESES_PLANILHA.items():
+        chave = _normalizar_nome_aba(nome_padrao)
+        aba_real = abas_disponiveis.get(chave)
         if not aba_real:
             continue
 
-        bruto = pd.read_excel(excel, sheet_name=aba_real, header=None, engine="openpyxl")
+        abas_lidas.append(str(aba_real))
+        bruto = pd.read_excel(
+            excel,
+            sheet_name=aba_real,
+            header=None,
+            engine="openpyxl",
+        )
         if bruto.shape[1] < 12:
             continue
 
-        parte = bruto.iloc[:, [0, 11]].copy()
-        parte.columns = ["Data", "Saldo"]
-        parte["Linha"] = parte.index + 1
-        parte["Data"] = parte["Data"].apply(
-            lambda x: _data_saldo(x, referencia.year, mes_num)
-        )
-        parte["Saldo"] = pd.to_numeric(parte["Saldo"], errors="coerce")
-        parte["Aba"] = aba_real
-        parte["Mes"] = mes_num
-        parte = parte.dropna(subset=["Data", "Saldo"])
-        parte = parte[parte["Saldo"] != 0]
+        # Percorre de baixo para cima: a primeira linha válida é a última atualização da aba.
+        for indice in range(len(bruto) - 1, -1, -1):
+            data_linha = _data_saldo(bruto.iat[indice, 0], referencia.year, mes_num)
+            saldo_linha = pd.to_numeric(bruto.iat[indice, 11], errors="coerce")
 
-        if not parte.empty:
-            registros.append(parte)
+            if pd.isna(data_linha) or pd.isna(saldo_linha):
+                continue
+            if float(saldo_linha) == 0:
+                continue
+            if pd.Timestamp(data_linha).date() > referencia:
+                continue
 
-    if not registros:
+            candidatos.append({
+                "saldo": float(saldo_linha),
+                "data_saldo": pd.Timestamp(data_linha).date(),
+                "aba": str(aba_real),
+                "mes_num": mes_num,
+                "linha_excel": indice + 1,
+            })
+            break
+
+    if not candidatos:
+        detalhe = ", ".join(excel.sheet_names)
         raise ValueError(
-            "Não encontrei saldo válido nas colunas A (data) e L (SOMA/SALDO) "
-            "das abas JANEIRO a DEZEMBRO."
+            "Nenhuma linha válida foi encontrada nas abas mensais. "
+            f"Abas recebidas do Google: {detalhe}"
         )
 
-    base = pd.concat(registros, ignore_index=True)
-    base = base[base["Data"].dt.year == referencia.year]
-
-    # Evita usar registros futuros por engano. Caso não exista nenhum registro até hoje,
-    # informa claramente o problema em vez de usar uma posição futura.
-    base_ate_hoje = base[base["Data"].dt.date <= referencia]
-    if base_ate_hoje.empty:
-        primeira = base.sort_values(["Data", "Linha"]).iloc[0]
-        raise ValueError(
-            f"Há saldos preenchidos, mas todos possuem data futura. "
-            f"Primeiro registro: {pd.Timestamp(primeira['Data']):%d/%m/%Y}, aba {primeira['Aba']}."
-        )
-
-    linha = base_ate_hoje.sort_values(["Data", "Mes", "Linha"]).iloc[-1]
-    data_saldo = pd.Timestamp(linha["Data"]).date()
-    origem = "Saldo da data vigente" if data_saldo == referencia else "Último saldo preenchido"
+    # A data é o critério principal; em empate, prevalece o mês e a linha mais abaixo.
+    ultimo = max(
+        candidatos,
+        key=lambda item: (item["data_saldo"], item["mes_num"], item["linha_excel"]),
+    )
 
     return {
-        "saldo": float(linha["Saldo"]),
-        "data_saldo": data_saldo,
+        **ultimo,
         "data_referencia": referencia,
-        "origem": origem,
-        "aba": str(linha["Aba"]),
-        "linha": int(linha["Linha"]),
+        "origem": "Última linha preenchida entre todas as abas mensais",
+        "abas_lidas": abas_lidas,
     }
 
 
@@ -538,11 +532,7 @@ with st.sidebar:
     )
     st.markdown("---")
     st.markdown("### Saldo bancário")
-    st.link_button(
-        "📄 Abrir planilha de saldos",
-        PLANILHA_SALDOS_LINK,
-        use_container_width=True,
-    )
+    st.link_button("↗ Abrir planilha de saldos", PLANILHA_SALDOS_LINK, use_container_width=True)
     atualizar_saldo = st.button("↻ Atualizar saldo agora", use_container_width=True)
     if atualizar_saldo:
         baixar_planilha_saldos.clear()
@@ -554,15 +544,11 @@ with st.sidebar:
         st.caption(
             f"Posição de {resultado_saldo['data_saldo']:%d/%m/%Y} · "
             f"{resultado_saldo['origem']} · aba {resultado_saldo['aba']} · "
-            f"linha {resultado_saldo['linha']}"
+            f"linha {resultado_saldo['linha_excel']}"
         )
     except Exception as erro_saldo:
         st.error("Não foi possível consultar automaticamente a planilha de saldos.")
         st.caption(str(erro_saldo))
-        st.info(
-            "Confirme no Google Sheets: Compartilhar → Acesso geral → "
-            "Qualquer pessoa com o link → Leitor. Depois clique em Atualizar saldo agora."
-        )
         opening_balance = st.number_input(
             "Saldo manual de contingência", value=0.0, step=1000.0, format="%.2f"
         )
