@@ -147,31 +147,62 @@ MESES_TEXTO = {
 }
 
 
-def _data_saldo(valor: object, ano: int, mes_padrao: int) -> pd.Timestamp:
-    """Converte datas reais do Excel e textos como '30 DE JULHO'."""
+def _data_saldo(valor: object, ano: int, mes_esperado: int) -> pd.Timestamp:
+    """Converte a célula da coluna A, sempre vinculando-a ao mês/ano vigentes."""
+    if valor is None or (isinstance(valor, float) and pd.isna(valor)):
+        return pd.NaT
+
     if isinstance(valor, (pd.Timestamp, date)):
-        return pd.Timestamp(valor).normalize()
+        data_convertida = pd.Timestamp(valor).normalize()
+    else:
+        texto_original = str(valor).strip()
+        if not texto_original:
+            return pd.NaT
 
-    convertido = pd.to_datetime(valor, errors="coerce", dayfirst=True)
-    if not pd.isna(convertido):
-        return pd.Timestamp(convertido).normalize()
+        texto_normalizado = unicodedata.normalize("NFKD", texto_original).encode("ascii", "ignore").decode("ascii")
+        texto_normalizado = re.sub(r"\s+", " ", texto_normalizado.strip().upper())
 
-    texto = norm_text(valor)
-    match = re.search(r"(\d{1,2})\s+DE\s+([A-Z]+)", texto)
-    if not match:
+        # Exemplos: 03 DE AGOSTO, 03 AGOSTO.
+        match_extenso = re.search(r"\b(\d{1,2})\s+(?:DE\s+)?([A-Z]+)(?:\s+DE\s+(\d{4}))?\b", texto_normalizado)
+        if match_extenso:
+            dia = int(match_extenso.group(1))
+            mes_texto = MESES_TEXTO.get(match_extenso.group(2))
+            ano_texto = int(match_extenso.group(3)) if match_extenso.group(3) else ano
+            if mes_texto is None:
+                return pd.NaT
+            try:
+                data_convertida = pd.Timestamp(year=ano_texto, month=mes_texto, day=dia)
+            except ValueError:
+                return pd.NaT
+        else:
+            # Exemplos: 03/08, 03/08/2026, 2026-08-03.
+            match_curta = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?", texto_original)
+            if match_curta:
+                dia = int(match_curta.group(1))
+                mes = int(match_curta.group(2))
+                ano_txt = match_curta.group(3)
+                ano_data = ano if not ano_txt else int(ano_txt)
+                if ano_data < 100:
+                    ano_data += 2000
+                try:
+                    data_convertida = pd.Timestamp(year=ano_data, month=mes, day=dia)
+                except ValueError:
+                    return pd.NaT
+            else:
+                convertido = pd.to_datetime(texto_original, errors="coerce", dayfirst=True)
+                if pd.isna(convertido):
+                    return pd.NaT
+                data_convertida = pd.Timestamp(convertido).normalize()
+
+    # Impede que uma linha de outro mês seja aceita dentro da aba vigente.
+    if data_convertida.year != ano or data_convertida.month != mes_esperado:
         return pd.NaT
-
-    dia = int(match.group(1))
-    mes = MESES_TEXTO.get(match.group(2), mes_padrao)
-    try:
-        return pd.Timestamp(year=ano, month=mes, day=dia)
-    except ValueError:
-        return pd.NaT
+    return data_convertida
 
 
 @st.cache_data(ttl=60, show_spinner=False)
 def baixar_aba_saldos(nome_aba: str) -> pd.DataFrame:
-    """Lê ao vivo o intervalo A4:L31 de uma aba do Google Sheets."""
+    """Lê ao vivo A4:L31 de uma única aba do Google Sheets."""
     url = f"https://docs.google.com/spreadsheets/d/{PLANILHA_SALDOS_ID}/gviz/tq"
     resposta = requests.get(
         url,
@@ -179,37 +210,43 @@ def baixar_aba_saldos(nome_aba: str) -> pd.DataFrame:
             "tqx": "out:csv",
             "sheet": nome_aba,
             "range": "A4:L31",
-            "_": str(pd.Timestamp.now().value),  # evita resposta antiga de proxy/CDN
+            "headers": "0",
+            "_": str(pd.Timestamp.now().value),
         },
-        headers={"User-Agent": "Mozilla/5.0"},
-        timeout=45,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        },
+        timeout=60,
         allow_redirects=True,
     )
     resposta.raise_for_status()
 
     conteudo = resposta.content
     tipo = resposta.headers.get("Content-Type", "").lower()
-    inicio = conteudo[:250].decode("utf-8", errors="ignore").lower()
+    inicio = conteudo[:300].decode("utf-8", errors="ignore").lower()
     if not conteudo:
         raise ValueError(f"A aba {nome_aba} retornou conteúdo vazio.")
     if "text/html" in tipo or "<html" in inicio or "<!doctype" in inicio:
         raise PermissionError(
-            "O Google retornou uma página HTML em vez dos dados da planilha. "
-            "Confirme o compartilhamento por link e se o arquivo é uma Planilha Google."
+            f"O Google não entregou os dados da aba {nome_aba}. "
+            "Abra a planilha pelo botão abaixo e confirme se a aba existe e está visível."
         )
 
     try:
-        quadro = pd.read_csv(io.BytesIO(conteudo), header=None, dtype=str)
+        quadro = pd.read_csv(io.BytesIO(conteudo), header=None, dtype=str, keep_default_na=False)
     except Exception as exc:
         raise ValueError(f"Não foi possível interpretar a aba {nome_aba}: {exc}") from exc
 
-    # O gviz pode omitir colunas vazias no fim. Garante A:L.
-    quadro = quadro.reindex(columns=range(12))
+    quadro = quadro.reindex(columns=range(12), fill_value="")
+    if quadro.empty:
+        raise ValueError(f"A aba {nome_aba} não possui dados no intervalo A4:L31.")
     return quadro
 
 
 def _numero_br_saldo(valor: object) -> float | None:
-    """Converte números e valores monetários brasileiros vindos do Google Sheets."""
+    """Converte o valor exibido na coluna L para número."""
     if valor is None or (isinstance(valor, float) and pd.isna(valor)):
         return None
     if isinstance(valor, (int, float, np.number)):
@@ -223,13 +260,10 @@ def _numero_br_saldo(valor: object) -> float | None:
     texto = texto.replace("R$", "").replace(" ", "").replace("\u00a0", "")
     texto = texto.replace("(", "").replace(")", "")
 
-    # Padrão brasileiro: 1.234.567,89
     if "," in texto:
         texto = texto.replace(".", "").replace(",", ".")
-    else:
-        # Sem vírgula: mantém ponto como decimal quando houver apenas um.
-        if texto.count(".") > 1:
-            texto = texto.replace(".", "")
+    elif texto.count(".") > 1:
+        texto = texto.replace(".", "")
 
     texto = re.sub(r"[^0-9.\-]", "", texto)
     if texto in {"", "-", ".", "-."}:
@@ -243,63 +277,49 @@ def _numero_br_saldo(valor: object) -> float | None:
 
 def buscar_saldo_drive(data_referencia: date | None = None) -> dict:
     """
-    Consulta ao vivo A4:L31 das abas mensais e retorna o saldo da data mais
-    recente preenchida até hoje. A data está em A e o saldo na mesma linha em L.
+    Consulta SOMENTE a aba do mês vigente. Dentro de A4:L31, procura a última
+    data preenchida até a data atual e usa o saldo da coluna L na mesma linha.
+    Nunca utiliza saldo de outro mês como fallback.
     """
     referencia = data_referencia or date.today()
-    registros: list[dict] = []
-    erros: list[str] = []
+    nome_aba = MESES_PLANILHA[referencia.month]
+    quadro = baixar_aba_saldos(nome_aba)
 
-    for mes_num, nome_aba in MESES_PLANILHA.items():
-        try:
-            quadro = baixar_aba_saldos(nome_aba)
-        except Exception as exc:
-            erros.append(f"{nome_aba}: {exc}")
+    registros: list[dict] = []
+    for posicao, linha in quadro.iterrows():
+        data_linha = _data_saldo(linha.iloc[0], referencia.year, referencia.month)
+        saldo_linha = _numero_br_saldo(linha.iloc[11])
+
+        if pd.isna(data_linha) or saldo_linha is None:
+            continue
+        if pd.Timestamp(data_linha).date() > referencia:
             continue
 
-        # A resposta já corresponde exatamente às linhas 4 a 31.
-        for posicao, linha in quadro.iterrows():
-            valor_data = linha.iloc[0] if len(linha) > 0 else None
-            valor_saldo_original = linha.iloc[11] if len(linha) > 11 else None
-
-            data_linha = _data_saldo(valor_data, referencia.year, mes_num)
-            saldo_linha = _numero_br_saldo(valor_saldo_original)
-
-            # "Preenchida" significa que ambas as células possuem valor válido.
-            if pd.isna(data_linha) or saldo_linha is None:
-                continue
-            if pd.Timestamp(data_linha).date() > referencia:
-                continue
-            if pd.Timestamp(data_linha).year != referencia.year:
-                continue
-
-            registros.append(
-                {
-                    "Data": pd.Timestamp(data_linha).normalize(),
-                    "Saldo": float(saldo_linha),
-                    "Aba": nome_aba,
-                    "Linha": int(posicao) + 4,
-                }
-            )
-
-    if not registros:
-        detalhe = " | ".join(erros[:4])
-        raise ValueError(
-            "Nenhum saldo válido foi encontrado ao vivo em A4:A31 e L4:L31. "
-            + (f"Diagnóstico: {detalhe}" if detalhe else "")
+        registros.append(
+            {
+                "Data": pd.Timestamp(data_linha).normalize(),
+                "Saldo": float(saldo_linha),
+                "Aba": nome_aba,
+                "Linha": int(posicao) + 4,
+            }
         )
 
-    base = pd.DataFrame(registros)
-    # Maior data; em empate, prevalece a linha mais baixa da aba.
-    base = base.sort_values(["Data", "Linha"], ascending=[True, True])
+    if not registros:
+        raise ValueError(
+            f"Nenhum saldo válido foi encontrado na aba vigente {nome_aba}, "
+            f"entre A4:A31 e L4:L31, até {referencia:%d/%m/%Y}. "
+            "A aplicação não utilizará dados de meses anteriores."
+        )
+
+    base = pd.DataFrame(registros).sort_values(["Data", "Linha"])
     ultimo = base.iloc[-1]
 
     return {
         "saldo": float(ultimo["Saldo"]),
         "data_saldo": pd.Timestamp(ultimo["Data"]).date(),
         "data_referencia": referencia,
-        "origem": "Consulta ao vivo no Google Sheets · intervalo A4:L31",
-        "aba": str(ultimo["Aba"]),
+        "origem": f"Aba vigente {nome_aba} · intervalo A4:L31",
+        "aba": nome_aba,
         "linha": int(ultimo["Linha"]),
     }
 
@@ -555,6 +575,11 @@ with st.sidebar:
     )
     st.markdown("---")
     st.markdown("### Saldo bancário")
+    st.link_button(
+        "↗ Abrir planilha de saldos",
+        "https://docs.google.com/spreadsheets/d/1NFHtHLaBdzukM0JltkzEExro8zZj1ktD/edit?usp=sharing&ouid=116238154054352363368&rtpof=true&sd=true",
+        use_container_width=True,
+    )
     atualizar_saldo = st.button("↻ Atualizar saldo agora", use_container_width=True)
     if atualizar_saldo:
         baixar_aba_saldos.clear()
