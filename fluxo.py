@@ -130,12 +130,8 @@ st.markdown(
 
 
 PLANILHA_SALDOS_ID = "1NFHtHLaBdzukM0JltkzEExro8zZj1ktD"
-PLANILHA_SALDOS_LINK = (
-    f"https://docs.google.com/spreadsheets/d/{PLANILHA_SALDOS_ID}/edit"
-)
 PLANILHA_SALDOS_URL = (
-    f"https://docs.google.com/spreadsheets/d/{PLANILHA_SALDOS_ID}/export"
-    f"?format=xlsx&id={PLANILHA_SALDOS_ID}"
+    f"https://docs.google.com/spreadsheets/d/{PLANILHA_SALDOS_ID}/export?format=xlsx"
 )
 
 MESES_PLANILHA = {
@@ -151,14 +147,8 @@ MESES_TEXTO = {
 }
 
 
-def _normalizar_nome_aba(nome: object) -> str:
-    texto = "" if nome is None else str(nome)
-    texto = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode("ascii")
-    return re.sub(r"[^A-Z]", "", texto.upper())
-
-
 def _data_saldo(valor: object, ano: int, mes_padrao: int) -> pd.Timestamp:
-    """Converte datas do Excel e textos como '03 DE AGOSTO'."""
+    """Converte datas reais do Excel e textos como '30 DE JULHO'."""
     if isinstance(valor, (pd.Timestamp, date)):
         return pd.Timestamp(valor).normalize()
 
@@ -167,7 +157,7 @@ def _data_saldo(valor: object, ano: int, mes_padrao: int) -> pd.Timestamp:
         return pd.Timestamp(convertido).normalize()
 
     texto = norm_text(valor)
-    match = re.search(r"(\d{1,2})\s+(?:DE\s+)?([A-Z]+)", texto)
+    match = re.search(r"(\d{1,2})\s+DE\s+([A-Z]+)", texto)
     if not match:
         return pd.NaT
 
@@ -179,105 +169,99 @@ def _data_saldo(valor: object, ano: int, mes_padrao: int) -> pd.Timestamp:
         return pd.NaT
 
 
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def baixar_planilha_saldos() -> bytes:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    }
-    resposta = requests.get(
-        PLANILHA_SALDOS_URL,
-        headers=headers,
-        params={"_ts": int(pd.Timestamp.now().timestamp())},
-        timeout=60,
-        allow_redirects=True,
-    )
+    resposta = requests.get(PLANILHA_SALDOS_URL, timeout=30)
     resposta.raise_for_status()
-    conteudo = resposta.content
-    if not conteudo:
+    if not resposta.content:
         raise ValueError("A planilha de saldos foi baixada sem conteúdo.")
-    if not conteudo.startswith(b"PK"):
-        tipo = resposta.headers.get("Content-Type", "não informado")
-        raise ValueError(
-            "O Google não devolveu um arquivo XLSX válido. "
-            f"Tipo recebido: {tipo}. Confirme que o link permite acesso sem login."
-        )
-    return conteudo
+    return resposta.content
 
 
 def buscar_saldo_drive(data_referencia: date | None = None) -> dict:
     """
-    Percorre todas as abas mensais e usa a última linha física preenchida
-    com data válida na coluna A e saldo válido na coluna L.
+    Busca o saldo mais recente exclusivamente no quadro diário de cada aba mensal.
+
+    Regras:
+    - Data: coluna A, linhas 4 a 31.
+    - Saldo: coluna L, na mesma linha da data.
+    - Percorre todas as abas mensais existentes.
+    - Considera somente datas até a data de referência.
+    - Ignora linhas sem data, sem saldo e saldos zerados, pois normalmente
+      representam dias ainda não atualizados na planilha.
+    - Retorna o registro de maior data; em empate, usa a linha mais baixa.
     """
     referencia = data_referencia or date.today()
     arquivo = baixar_planilha_saldos()
     excel = pd.ExcelFile(io.BytesIO(arquivo), engine="openpyxl")
 
-    # Aceita diferenças de caixa, acentos e espaços: AGOSTO, Agosto, AGOSTO  etc.
-    abas_disponiveis = {
-        _normalizar_nome_aba(nome): nome for nome in excel.sheet_names
-    }
-
-    candidatos: list[dict] = []
-    abas_lidas: list[str] = []
+    # Relaciona os nomes reais das abas, tolerando espaços, caixa e acentos.
+    abas_reais = {norm_text(nome): nome for nome in excel.sheet_names}
+    registros: list[dict] = []
 
     for mes_num, nome_padrao in MESES_PLANILHA.items():
-        chave = _normalizar_nome_aba(nome_padrao)
-        aba_real = abas_disponiveis.get(chave)
-        if not aba_real:
+        nome_real = abas_reais.get(norm_text(nome_padrao))
+        if not nome_real:
             continue
 
-        abas_lidas.append(str(aba_real))
         bruto = pd.read_excel(
             excel,
-            sheet_name=aba_real,
+            sheet_name=nome_real,
             header=None,
             engine="openpyxl",
         )
+
+        # É necessário existir pelo menos até a coluna L.
         if bruto.shape[1] < 12:
             continue
 
-        # Percorre de baixo para cima: a primeira linha válida é a última atualização da aba.
-        for indice in range(len(bruto) - 1, -1, -1):
-            data_linha = _data_saldo(bruto.iat[indice, 0], referencia.year, mes_num)
-            saldo_linha = pd.to_numeric(bruto.iat[indice, 11], errors="coerce")
+        # Excel A4:L31 corresponde, no pandas, aos índices 3:31.
+        limite_final = min(31, len(bruto))
+        quadro = bruto.iloc[3:limite_final, [0, 11]].copy()
+        quadro.columns = ["Data", "Saldo"]
+        quadro["Linha"] = quadro.index + 1  # número real da linha no Excel
+        quadro["Aba"] = nome_real
 
-            if pd.isna(data_linha) or pd.isna(saldo_linha):
-                continue
-            if float(saldo_linha) == 0:
-                continue
-            if pd.Timestamp(data_linha).date() > referencia:
-                continue
+        quadro["Data"] = quadro["Data"].apply(
+            lambda valor: _data_saldo(valor, referencia.year, mes_num)
+        )
+        quadro["Saldo"] = pd.to_numeric(quadro["Saldo"], errors="coerce")
 
-            candidatos.append({
-                "saldo": float(saldo_linha),
-                "data_saldo": pd.Timestamp(data_linha).date(),
-                "aba": str(aba_real),
-                "mes_num": mes_num,
-                "linha_excel": indice + 1,
-            })
-            break
+        quadro = quadro.dropna(subset=["Data", "Saldo"])
+        quadro = quadro[
+            (quadro["Data"].dt.date <= referencia)
+            & (quadro["Data"].dt.year == referencia.year)
+            & (quadro["Saldo"] != 0)
+        ]
 
-    if not candidatos:
-        detalhe = ", ".join(excel.sheet_names)
+        for _, linha in quadro.iterrows():
+            registros.append(
+                {
+                    "Data": pd.Timestamp(linha["Data"]),
+                    "Saldo": float(linha["Saldo"]),
+                    "Aba": str(linha["Aba"]),
+                    "Linha": int(linha["Linha"]),
+                }
+            )
+
+    if not registros:
         raise ValueError(
-            "Nenhuma linha válida foi encontrada nas abas mensais. "
-            f"Abas recebidas do Google: {detalhe}"
+            "Nenhum saldo válido foi encontrado nas células A4:A31 e L4:L31 "
+            f"até {referencia:%d/%m/%Y}."
         )
 
-    # A data é o critério principal; em empate, prevalece o mês e a linha mais abaixo.
-    ultimo = max(
-        candidatos,
-        key=lambda item: (item["data_saldo"], item["mes_num"], item["linha_excel"]),
+    base = pd.DataFrame(registros).sort_values(
+        ["Data", "Linha"], ascending=[True, True]
     )
+    ultimo = base.iloc[-1]
 
     return {
-        **ultimo,
+        "saldo": float(ultimo["Saldo"]),
+        "data_saldo": pd.Timestamp(ultimo["Data"]).date(),
         "data_referencia": referencia,
-        "origem": "Última linha preenchida entre todas as abas mensais",
-        "abas_lidas": abas_lidas,
+        "origem": "Último saldo preenchido no quadro diário A4:L31",
+        "aba": str(ultimo["Aba"]),
+        "linha": int(ultimo["Linha"]),
     }
 
 
@@ -532,7 +516,6 @@ with st.sidebar:
     )
     st.markdown("---")
     st.markdown("### Saldo bancário")
-    st.link_button("↗ Abrir planilha de saldos", PLANILHA_SALDOS_LINK, use_container_width=True)
     atualizar_saldo = st.button("↻ Atualizar saldo agora", use_container_width=True)
     if atualizar_saldo:
         baixar_planilha_saldos.clear()
@@ -544,7 +527,7 @@ with st.sidebar:
         st.caption(
             f"Posição de {resultado_saldo['data_saldo']:%d/%m/%Y} · "
             f"{resultado_saldo['origem']} · aba {resultado_saldo['aba']} · "
-            f"linha {resultado_saldo['linha_excel']}"
+            f"linha {resultado_saldo.get('linha', '-')}"
         )
     except Exception as erro_saldo:
         st.error("Não foi possível consultar automaticamente a planilha de saldos.")
