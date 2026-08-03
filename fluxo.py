@@ -13,7 +13,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from streamlit_option_menu import option_menu
+from openpyxl import load_workbook
 
 st.set_page_config(
     page_title="Cockpit Financeiro Executivo",
@@ -179,50 +179,79 @@ def baixar_planilha_saldos() -> bytes:
 
 
 def buscar_saldo_drive(data_referencia: date | None = None) -> dict:
-    """Busca a posição da data atual; se vazia/zero, usa o último saldo válido anterior."""
+    """
+    Percorre todas as abas mensais e retorna o saldo da última linha
+    efetivamente preenchida na coluna L.
+
+    Regras:
+    - considera somente abas de JANEIRO a DEZEMBRO existentes no arquivo;
+    - lê a coluna A como data e a coluna L como saldo;
+    - ignora linhas sem data, sem saldo ou com saldo igual a zero;
+    - escolhe o registro de data mais recente entre todas as abas;
+    - em caso de empate de data, prevalece a linha mais baixa da planilha.
+    """
     referencia = data_referencia or date.today()
     arquivo = baixar_planilha_saldos()
-    excel = pd.ExcelFile(io.BytesIO(arquivo), engine="openpyxl")
 
-    registros: list[pd.DataFrame] = []
-    for mes_num, aba in MESES_PLANILHA.items():
-        if mes_num > referencia.month or aba not in excel.sheet_names:
+    workbook = load_workbook(
+        filename=io.BytesIO(arquivo),
+        data_only=True,
+        read_only=True,
+    )
+
+    candidatos: list[dict] = []
+
+    for mes_num, aba_esperada in MESES_PLANILHA.items():
+        # Aceita pequenas diferenças de acentuação ou espaços no nome da aba.
+        aba_real = next(
+            (nome for nome in workbook.sheetnames if norm_text(nome) == norm_text(aba_esperada)),
+            None,
+        )
+        if aba_real is None:
             continue
-        bruto = pd.read_excel(excel, sheet_name=aba, header=None, engine="openpyxl")
-        if bruto.shape[1] < 12:
-            continue
-        parte = bruto.iloc[:, [0, 11]].copy()
-        parte.columns = ["Data", "Saldo"]
-        parte["Data"] = parte["Data"].apply(lambda x: _data_saldo(x, referencia.year, mes_num))
-        parte["Saldo"] = pd.to_numeric(parte["Saldo"], errors="coerce")
-        parte["Aba"] = aba
-        registros.append(parte)
 
-    if not registros:
-        raise ValueError("Nenhuma aba mensal válida foi encontrada na planilha de saldos.")
+        ws = workbook[aba_real]
 
-    base = pd.concat(registros, ignore_index=True)
-    base = base.dropna(subset=["Data", "Saldo"])
-    base = base[(base["Data"].dt.date <= referencia) & (base["Data"].dt.year == referencia.year)]
-    base = base.sort_values("Data")
+        # Percorre de baixo para cima para localizar a última linha válida da aba.
+        for numero_linha in range(ws.max_row, 0, -1):
+            valor_data = ws.cell(numero_linha, 1).value   # coluna A
+            valor_saldo = ws.cell(numero_linha, 12).value # coluna L
 
-    exata = base[(base["Data"].dt.date == referencia) & (base["Saldo"] != 0)]
-    if not exata.empty:
-        linha = exata.iloc[-1]
-        origem = "Saldo da data vigente"
-    else:
-        validos = base[base["Saldo"] != 0]
-        if validos.empty:
-            raise ValueError(f"Não há saldo válido até {referencia:%d/%m/%Y}.")
-        linha = validos.iloc[-1]
-        origem = "Último saldo válido anterior"
+            data_linha = _data_saldo(valor_data, referencia.year, mes_num)
+            saldo_linha = pd.to_numeric(valor_saldo, errors="coerce")
+
+            if pd.isna(data_linha) or pd.isna(saldo_linha):
+                continue
+            if float(saldo_linha) == 0:
+                continue
+
+            candidatos.append({
+                "Data": pd.Timestamp(data_linha).normalize(),
+                "Saldo": float(saldo_linha),
+                "Aba": aba_real,
+                "Mes": mes_num,
+                "Linha": numero_linha,
+            })
+            break
+
+    if not candidatos:
+        raise ValueError(
+            "Nenhuma linha válida com data e saldo foi encontrada nas abas mensais."
+        )
+
+    base = pd.DataFrame(candidatos).sort_values(
+        ["Data", "Mes", "Linha"],
+        ascending=[True, True, True],
+    )
+    linha = base.iloc[-1]
 
     return {
         "saldo": float(linha["Saldo"]),
         "data_saldo": pd.Timestamp(linha["Data"]).date(),
         "data_referencia": referencia,
-        "origem": origem,
+        "origem": "Última linha preenchida entre as abas mensais",
         "aba": str(linha["Aba"]),
+        "linha": int(linha["Linha"]),
     }
 
 
@@ -463,20 +492,26 @@ def excel_bytes(detail: pd.DataFrame, daily: pd.DataFrame, weekly: pd.DataFrame,
 with st.sidebar:
     st.markdown("## 📊 Cockpit Financeiro")
     st.caption("Visão executiva de caixa")
-    page = option_menu(
-        menu_title=None,
-        options=["Painel Executivo", "Agenda Financeira", "Entradas", "Saídas", "Histórico", "Como emitir relatórios", "Exportações"],
-        icons=["speedometer2", "calendar3", "arrow-down-circle", "arrow-up-circle", "clock-history", "question-circle", "file-earmark-arrow-down"],
-        default_index=0,
-        styles={
-            "container": {"padding": "2px", "background-color": "transparent"},
-            "icon": {"color": "#1E3A5F", "font-size": "18px"},
-            "nav-link": {"font-size": "15px", "font-weight": "700", "color": "#1E293B", "margin": "5px 0", "padding": "13px 14px", "border-radius": "11px", "background-color": "#FFFFFF", "border": "1px solid #DDE5EF"},
-            "nav-link-selected": {"background-color": ENTRY, "color": "#FFFFFF", "box-shadow": "0 8px 20px rgba(21,101,192,.24)", "border": "1px solid #1565C0"},
-        },
+    page = st.radio(
+        "Navegação",
+        [
+            "Painel Executivo",
+            "Agenda Financeira",
+            "Entradas",
+            "Saídas",
+            "Histórico",
+            "Como emitir relatórios",
+            "Exportações",
+        ],
+        label_visibility="collapsed",
     )
     st.markdown("---")
     st.markdown("### Saldo bancário")
+    st.link_button(
+        "📄 Abrir planilha de saldos",
+        "https://docs.google.com/spreadsheets/d/1NFHtHLaBdzukM0JltkzEExro8zZj1ktD/edit?usp=sharing&ouid=116238154054352363368&rtpof=true&sd=true",
+        use_container_width=True,
+    )
     atualizar_saldo = st.button("↻ Atualizar saldo agora", use_container_width=True)
     if atualizar_saldo:
         baixar_planilha_saldos.clear()
@@ -487,7 +522,7 @@ with st.sidebar:
         st.success(f"Saldo atual: {money_br(opening_balance)}")
         st.caption(
             f"Posição de {resultado_saldo['data_saldo']:%d/%m/%Y} · "
-            f"{resultado_saldo['origem']} · aba {resultado_saldo['aba']}"
+            f"{resultado_saldo['origem']} · aba {resultado_saldo['aba']} · linha {resultado_saldo['linha']}"
         )
     except Exception as erro_saldo:
         st.error("Não foi possível consultar automaticamente a planilha de saldos.")
