@@ -196,6 +196,31 @@ def _data_saldo(valor: object, ano: int, mes_padrao: int) -> pd.Timestamp:
         except ValueError:
             return pd.NaT
 
+    # Formato exibido pelo Google Sheets quando a célula usa uma data abreviada:
+    # "3-ago", "03/ago" ou "3 ago". O CSV do endpoint gviz devolve o texto
+    # formatado, e não necessariamente o valor Date(...) interno.
+    match_mes_abreviado = re.fullmatch(
+        r"(\d{1,2})[\s./-]+([A-Z]{3,9})(?:[\s./-]+(\d{2,4}))?",
+        texto,
+    )
+    if match_mes_abreviado:
+        dia = int(match_mes_abreviado.group(1))
+        nome_mes = match_mes_abreviado.group(2)
+        meses_abreviados = {
+            nome[:3]: numero
+            for nome, numero in MESES_TEXTO.items()
+        }
+        mes = MESES_TEXTO.get(nome_mes, meses_abreviados.get(nome_mes[:3]))
+        if mes is not None:
+            ano_texto = match_mes_abreviado.group(3)
+            ano_data = int(ano_texto) if ano_texto else ano
+            if ano_texto and len(ano_texto) == 2:
+                ano_data += 2000
+            try:
+                return pd.Timestamp(year=ano_data, month=mes, day=dia)
+            except ValueError:
+                return pd.NaT
+
     # Dia isolado, comum quando a célula está formatada apenas para exibir o dia.
     if re.fullmatch(r"\d{1,2}", texto):
         try:
