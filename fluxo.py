@@ -943,8 +943,11 @@ elif page == "Entradas":
     with e3: kpi_card("Total de entradas", money_br(inflows), f"Clientes {customer_total/inflows:.1%} · Cartões {card_total/inflows:.1%}" if inflows else "Sem entradas", "kpi-entry")
     with e4: kpi_card("Recebimentos atrasados", money_br(overdue_month_total), f"{overdue_month_count} título(s) vencido(s) no mês · fora do saldo", "kpi-neutral")
 
-    st.markdown('<div class="section-head"><h2>Agenda de títulos a receber</h2><p>Valores vencidos permanecem visíveis para cobrança, mas não alteram o saldo projetado.</p></div>', unsafe_allow_html=True)
-    receivable_agenda = pd.concat([receivables_projected, receivables_overdue], ignore_index=True)
+    st.markdown('<div class="section-head"><h2>Agenda de entradas</h2><p>Títulos a receber e cartões compõem as entradas previstas. Títulos vencidos permanecem visíveis para cobrança, mas não alteram o saldo projetado.</p></div>', unsafe_allow_html=True)
+    receivable_agenda = pd.concat(
+        [receivables_projected, receivables_overdue, cards],
+        ignore_index=True,
+    )
     receivable_agenda = receivable_agenda[
         receivable_agenda["Empresa"].isin(selected_companies)
     ].copy()
@@ -966,7 +969,10 @@ elif page == "Entradas":
         month_receivables = receivable_agenda[
             receivable_agenda["Data"].dt.to_period("M").eq(selected_receivable_month)
         ].copy()
-        month_receivables["Em atraso"] = month_receivables["Data"].dt.normalize() < today_ts
+        month_receivables["Em atraso"] = (
+            month_receivables["Origem"].eq("Títulos a receber")
+            & (month_receivables["Data"].dt.normalize() < today_ts)
+        )
         receivable_daily = month_receivables.groupby(month_receivables["Data"].dt.day).agg(
             Total=("Valor", "sum"),
             Atrasado=("Valor", lambda values: float(values[month_receivables.loc[values.index, "Em atraso"]].sum())),
@@ -1037,10 +1043,13 @@ elif page == "Entradas":
         rec_detail = consolidate_documents(receivable_scope)
         if not rec_detail.empty:
             rec_detail["Situação"] = np.where(
-                rec_detail["Data"].dt.normalize() < today_ts, "Em atraso", "A vencer"
+                rec_detail["Origem"].eq("Títulos a receber")
+                & (rec_detail["Data"].dt.normalize() < today_ts),
+                "Em atraso",
+                np.where(rec_detail["Origem"].eq("Cartões"), "Cartão previsto", "A vencer"),
             )
             rec_detail = rec_detail[
-                ["Data", "Situação", "Empresa", "Contraparte", "Documento", "Histórico", "Valor", "Quantidade de lançamentos"]
+                ["Data", "Origem", "Situação", "Empresa", "Contraparte", "Documento", "Histórico", "Valor", "Quantidade de lançamentos"]
             ].rename(columns={"Contraparte": "Cliente", "Valor": "Valor líquido"})
             rec_detail["Data"] = rec_detail["Data"].dt.strftime("%d/%m/%Y")
             styled_table(rec_detail, ["Valor líquido"], "Valor líquido", ENTRY, 390)
