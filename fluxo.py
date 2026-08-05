@@ -6,6 +6,7 @@ import re
 import requests
 import unicodedata
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Iterable
 
 import numpy as np
@@ -601,6 +602,16 @@ def render_fullscreen_image(image_b64: str, alt: str) -> None:
         unsafe_allow_html=True,
     )
 
+
+def guide_image_from_file(filename: str, fallback_b64: str) -> str:
+    """Carrega uma imagem de tutorial ao lado do app e preserva o fallback incorporado."""
+    image_path = Path(__file__).resolve().with_name(filename)
+    try:
+        return base64.b64encode(image_path.read_bytes()).decode("ascii")
+    except OSError:
+        return fallback_b64
+
+
 def styled_table(df: pd.DataFrame, money_cols: list[str], color_col: str | None = None, color: str = TEXT, height: int = 430):
     styler = df.style
     if money_cols:
@@ -697,8 +708,11 @@ if page == "Como emitir relatórios":
         st.info("A aplicação exclui automaticamente documentos terminados em -TE.")
 
     with tab_card:
-        st.markdown('<div class="guide-card"><div class="guide-title">Cartões — Analítico</div><div class="guide-note">Defina o período de vencimento, mantenha Tipo de Cartão = Todos, Cartões por Recebimento, exibição de vendedor/código/NSU = Sim, agrupamento por Cartão, ordenação por Vencimento e destino CSV. Clique na imagem para abrir em tela cheia.</div>', unsafe_allow_html=True)
-        render_fullscreen_image(IMG_CARTOES_B64, "Configuração do relatório de cartões")
+        st.markdown('<div class="guide-card"><div class="guide-title">Cartões — Analítico</div><div class="guide-note">Defina o período de vencimento, mantenha Tipo de Cartão = Todos, Títulos = Todos, Ajustar vencimentos = Não e <b>Cartões por = Todos</b>. Use exibição de vendedor/código/NSU = Sim, agrupamento por Cartão, ordenação por Vencimento e destino CSV. Clique na imagem para abrir em tela cheia.</div>', unsafe_allow_html=True)
+        render_fullscreen_image(
+            guide_image_from_file("tutorial_cartoes_todos.png", IMG_CARTOES_B64),
+            "Configuração do relatório de cartões — Cartões por Todos",
+        )
         st.markdown('</div>', unsafe_allow_html=True)
 
     with tab_pay:
@@ -724,7 +738,13 @@ except Exception as exc:
     st.error(f"Erro ao interpretar os arquivos: {exc}")
     st.stop()
 
-base_raw = pd.concat([receivables, cards, payables], ignore_index=True).sort_values("Data")
+# Títulos vencidos antes de hoje permanecem disponíveis para análise, mas não
+# entram na projeção: não há garantia de que serão recebidos na data já vencida.
+today_ts = pd.Timestamp(date.today())
+receivables_overdue = receivables[receivables["Data"].dt.normalize() < today_ts].copy()
+receivables_projected = receivables[receivables["Data"].dt.normalize() >= today_ts].copy()
+
+base_raw = pd.concat([receivables_projected, cards, payables], ignore_index=True).sort_values("Data")
 if base_raw.empty:
     st.warning("Nenhum lançamento válido foi encontrado.")
     st.stop()
@@ -750,6 +770,14 @@ filtered_raw = base_raw[
     base_raw["Data"].dt.date.between(start_date, end_date)
     & base_raw["Empresa"].isin(selected_companies)
 ].copy()
+overdue_filtered = receivables_overdue[
+    receivables_overdue["Empresa"].isin(selected_companies)
+].copy()
+overdue_in_current_month = overdue_filtered[
+    overdue_filtered["Data"].dt.to_period("M").eq(today_ts.to_period("M"))
+].copy()
+overdue_month_total = float(overdue_in_current_month["Valor"].sum())
+overdue_month_count = int(len(overdue_in_current_month))
 filtered = consolidate_documents(filtered_raw)
 if filtered.empty:
     st.warning("Não existem lançamentos para os filtros selecionados.")
@@ -780,6 +808,13 @@ if page == "Painel Executivo":
     with k4: kpi_card("Saldo final projetado", money_br(ending), f"Resultado do período: {money_br(net)}", "kpi-balance" if ending >= 0 else "kpi-exit")
 
     st.markdown("<br>", unsafe_allow_html=True)
+    if overdue_month_count:
+        st.markdown(
+            f'<div class="status-warning"><b>Recebimentos vencidos no mês:</b> '
+            f'{money_br(overdue_month_total)} em {overdue_month_count} título(s). '
+            'Esse valor é acompanhado separadamente e não compõe o saldo final projetado.</div>',
+            unsafe_allow_html=True,
+        )
     if minimum_projected < 0:
         st.markdown(f'<div class="status-danger">Caixa crítico: a pior posição projetada é <b>{money_br(minimum_projected)}</b> em <b>{minimum_date:%d/%m/%Y}</b>. Necessidade para atingir a reserva: <b>{money_br(cash_need)}</b>.</div>', unsafe_allow_html=True)
     elif minimum_cash and minimum_projected < minimum_cash:
@@ -822,12 +857,13 @@ if page == "Painel Executivo":
 
 elif page == "Entradas":
     st.markdown('<div class="section-head"><h2>Gestão de entradas</h2><p>Recebimentos agrupados por cliente e visão líquida dos cartões.</p></div>', unsafe_allow_html=True)
-    e1, e2, e3 = st.columns(3)
+    e1, e2, e3, e4 = st.columns(4)
     with e1: kpi_card("Recebimentos de clientes", money_br(customer_total), f"{filtered_raw[filtered_raw['Origem'].eq('Títulos a receber')]['Contraparte'].nunique()} clientes", "kpi-entry")
     with e2: kpi_card("Recebimentos de cartões", money_br(card_total), "Valor líquido previsto", "kpi-entry")
     with e3: kpi_card("Total de entradas", money_br(inflows), f"Clientes {customer_total/inflows:.1%} · Cartões {card_total/inflows:.1%}" if inflows else "Sem entradas", "kpi-entry")
+    with e4: kpi_card("Recebimentos atrasados", money_br(overdue_month_total), f"{overdue_month_count} título(s) vencido(s) no mês · fora do saldo", "kpi-neutral")
 
-    tab_clientes, tab_cartoes = st.tabs(["Clientes agrupados", "Cartões — valor líquido"])
+    tab_clientes, tab_atrasados, tab_cartoes = st.tabs(["Clientes agrupados", "Atrasados no mês", "Cartões — valor líquido"])
     with tab_clientes:
         customer_raw = filtered_raw[filtered_raw["Origem"].eq("Títulos a receber")].copy()
         customer_group = customer_raw.groupby(["Contraparte", "Empresa"], as_index=False).agg(
@@ -847,6 +883,24 @@ elif page == "Entradas":
         detail["Data"] = detail["Data"].dt.strftime("%d/%m/%Y")
         styled_table(detail, ["Valor líquido"], "Valor líquido", ENTRY, 390)
 
+    with tab_atrasados:
+        st.caption(
+            f"Títulos com vencimento anterior a {date.today():%d/%m/%Y}. "
+            "Eles ficam visíveis para cobrança, mas não entram na projeção do saldo."
+        )
+        overdue_detail = consolidate_documents(overdue_in_current_month)
+        if overdue_detail.empty:
+            st.info("Não há títulos vencidos no mês atual para as empresas selecionadas.")
+        else:
+            overdue_detail = overdue_detail[
+                ["Data", "Empresa", "Contraparte", "Documento", "Histórico", "Valor", "Quantidade de lançamentos"]
+            ].rename(columns={"Contraparte": "Cliente", "Valor": "Valor líquido em atraso"})
+            overdue_detail["Dias em atraso"] = (
+                today_ts - pd.to_datetime(overdue_detail["Data"]).dt.normalize()
+            ).dt.days
+            overdue_detail["Data"] = overdue_detail["Data"].dt.strftime("%d/%m/%Y")
+            styled_table(overdue_detail, ["Valor líquido em atraso"], "Valor líquido em atraso", WARNING, 440)
+
     with tab_cartoes:
         card_raw = filtered_raw[filtered_raw["Origem"].eq("Cartões")].copy()
         card_summary = card_raw.groupby(["Data","Empresa"], as_index=False).agg(**{"Valor líquido":("Valor","sum"), "Quantidade de lançamentos":("Valor","size")}).sort_values("Data")
@@ -857,26 +911,123 @@ elif page == "Entradas":
         styled_table(card_detail, ["Valor líquido"], "Valor líquido", ENTRY, 440)
 
 elif page == "Saídas":
-    st.markdown('<div class="section-head"><h2>Gestão de saídas</h2><p>Ranking, concentração e detalhamento dos compromissos a pagar.</p></div>', unsafe_allow_html=True)
-    s1, s2, s3 = st.columns(3)
+    import calendar as _calendar
+
+    st.markdown('<div class="section-head"><h2>Agenda de saídas</h2><p>Clique em uma data para analisar o dia ou selecione duas datas para formar um período.</p></div>', unsafe_allow_html=True)
     payable_raw = filtered_raw[filtered_raw["Natureza"].eq("Saída")].copy()
-    supplier_group = payable_raw.groupby("Contraparte", as_index=False).agg(Valor=("Valor","sum"), Documentos=("Documento","nunique"), Empresas=("Empresa",join_unique)).sort_values("Valor", ascending=False)
-    with s1: kpi_card("Total a pagar", money_br(outflows), "Valor líquido do período", "kpi-exit")
+
+    payable_months = sorted(payable_raw["Data"].dt.to_period("M").unique())
+    if not payable_months:
+        st.info("Não há saídas para os filtros selecionados.")
+        st.stop()
+    selected_payable_month = st.selectbox(
+        "Mês da agenda de saídas",
+        payable_months,
+        format_func=lambda period: period.strftime("%B/%Y").capitalize(),
+        key="payable_calendar_month",
+    )
+    month_payables = payable_raw[
+        payable_raw["Data"].dt.to_period("M").eq(selected_payable_month)
+    ].copy()
+    daily_payables = month_payables.groupby(month_payables["Data"].dt.day)["Valor"].sum().to_dict()
+
+    selection_key = f"payable_selected_dates_{selected_payable_month}"
+    if selection_key not in st.session_state:
+        st.session_state[selection_key] = []
+    selected_output_dates = list(st.session_state[selection_key])
+
+    clear_col, hint_col = st.columns([0.8, 3.2])
+    with clear_col:
+        if st.button("Limpar seleção", use_container_width=True, disabled=not selected_output_dates):
+            st.session_state[selection_key] = []
+            st.rerun()
+    with hint_col:
+        if len(selected_output_dates) == 1:
+            st.info(f"Dia selecionado: {pd.Timestamp(selected_output_dates[0]):%d/%m/%Y}. Clique em outro dia para fechar o período.")
+        elif len(selected_output_dates) == 2:
+            st.info(
+                f"Período selecionado: {pd.Timestamp(min(selected_output_dates)):%d/%m/%Y} "
+                f"a {pd.Timestamp(max(selected_output_dates)):%d/%m/%Y}."
+            )
+        else:
+            st.caption("Nenhuma data selecionada: os indicadores consideram todo o mês exibido.")
+
+    week_header = st.columns(7)
+    for column, label in zip(week_header, ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]):
+        column.markdown(f"<div style='text-align:center;font-weight:800;color:{MUTED}'>{label}</div>", unsafe_allow_html=True)
+
+    calendar_weeks = _calendar.Calendar(firstweekday=0).monthdayscalendar(
+        selected_payable_month.year, selected_payable_month.month
+    )
+    for week_index, week in enumerate(calendar_weeks):
+        week_columns = st.columns(7)
+        for column, day_number in zip(week_columns, week):
+            if not day_number:
+                column.markdown("<div style='height:72px'></div>", unsafe_allow_html=True)
+                continue
+            day_date = date(selected_payable_month.year, selected_payable_month.month, day_number)
+            day_value = float(daily_payables.get(day_number, 0.0))
+            is_selected = day_date.isoformat() in selected_output_dates
+            label = f"{'✓ ' if is_selected else ''}{day_number:02d}\n{money_br(day_value)}"
+            if column.button(
+                label,
+                key=f"payable_day_{selected_payable_month}_{day_number}",
+                use_container_width=True,
+                type="primary" if is_selected else "secondary",
+            ):
+                current = list(st.session_state[selection_key])
+                day_token = day_date.isoformat()
+                if day_token in current:
+                    current.remove(day_token)
+                elif len(current) >= 2:
+                    current = [day_token]
+                else:
+                    current.append(day_token)
+                st.session_state[selection_key] = sorted(current)
+                st.rerun()
+
+    selected_output_dates = list(st.session_state[selection_key])
+    if selected_output_dates:
+        range_start = pd.Timestamp(min(selected_output_dates))
+        range_end = pd.Timestamp(max(selected_output_dates))
+        payable_scope = month_payables[
+            month_payables["Data"].dt.normalize().between(range_start, range_end)
+        ].copy()
+        scope_note = (
+            f"{range_start:%d/%m/%Y}"
+            if range_start == range_end
+            else f"{range_start:%d/%m/%Y} a {range_end:%d/%m/%Y}"
+        )
+    else:
+        payable_scope = month_payables.copy()
+        scope_note = selected_payable_month.strftime("%m/%Y")
+
+    selected_outflows = float(payable_scope["Valor"].sum())
+    supplier_group = payable_scope.groupby("Contraparte", as_index=False).agg(
+        Valor=("Valor","sum"), Documentos=("Documento","nunique"), Empresas=("Empresa",join_unique)
+    ).sort_values("Valor", ascending=False)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    s1, s2, s3 = st.columns(3)
+    with s1: kpi_card("Total a pagar", money_br(selected_outflows), f"Período: {scope_note}", "kpi-exit")
     with s2: kpi_card("Fornecedores", f"{supplier_group['Contraparte'].nunique()}", "Contrapartes com vencimentos", "kpi-exit")
     with s3: kpi_card("Maior compromisso", money_br(supplier_group.iloc[0]["Valor"] if not supplier_group.empty else 0), supplier_group.iloc[0]["Contraparte"] if not supplier_group.empty else "Sem compromissos", "kpi-exit")
 
-    top = supplier_group.head(15).sort_values("Valor")
-    fig_top = px.bar(top, x="Valor", y="Contraparte", orientation="h", color_discrete_sequence=[EXIT], text_auto=".2s")
-    fig_top.update_layout(height=500, paper_bgcolor="#FFF", plot_bgcolor="#FFF", margin=dict(l=15,r=15,t=20,b=15), xaxis_title="", yaxis_title="")
-    st.plotly_chart(fig_top, use_container_width=True)
+    if payable_scope.empty:
+        st.info("Não há saídas no período selecionado.")
+    else:
+        top = supplier_group.head(15).sort_values("Valor")
+        fig_top = px.bar(top, x="Valor", y="Contraparte", orientation="h", color_discrete_sequence=[EXIT], text_auto=".2s")
+        fig_top.update_layout(height=430, paper_bgcolor="#FFF", plot_bgcolor="#FFF", margin=dict(l=15,r=15,t=20,b=15), xaxis_title="", yaxis_title="")
+        st.plotly_chart(fig_top, use_container_width=True)
 
-    styled_table(supplier_group.rename(columns={"Contraparte":"Fornecedor","Valor":"Valor líquido"}), ["Valor líquido"], "Valor líquido", EXIT, 380)
-    supplier_options = supplier_group["Contraparte"].tolist()
-    selected_suppliers = st.multiselect("Fornecedores para detalhar", supplier_options, default=supplier_options[:5])
-    payable_detail = consolidate_documents(payable_raw[payable_raw["Contraparte"].isin(selected_suppliers)])
-    payable_detail = payable_detail[["Data","Empresa","Contraparte","Documento","Conta","Histórico","Valor","Quantidade de lançamentos"]].rename(columns={"Contraparte":"Fornecedor","Valor":"Valor líquido"})
-    payable_detail["Data"] = payable_detail["Data"].dt.strftime("%d/%m/%Y")
-    styled_table(payable_detail, ["Valor líquido"], "Valor líquido", EXIT, 470)
+        styled_table(supplier_group.rename(columns={"Contraparte":"Fornecedor","Valor":"Valor líquido"}), ["Valor líquido"], "Valor líquido", EXIT, 330)
+        supplier_options = supplier_group["Contraparte"].tolist()
+        selected_suppliers = st.multiselect("Fornecedores para detalhar", supplier_options, default=supplier_options)
+        payable_detail = consolidate_documents(payable_scope[payable_scope["Contraparte"].isin(selected_suppliers)])
+        payable_detail = payable_detail[["Data","Empresa","Contraparte","Documento","Conta","Histórico","Valor","Quantidade de lançamentos"]].rename(columns={"Contraparte":"Fornecedor","Valor":"Valor líquido"})
+        payable_detail["Data"] = payable_detail["Data"].dt.strftime("%d/%m/%Y")
+        styled_table(payable_detail, ["Valor líquido"], "Valor líquido", EXIT, 470)
 
 elif page == "Agenda Financeira":
     import calendar as _calendar
