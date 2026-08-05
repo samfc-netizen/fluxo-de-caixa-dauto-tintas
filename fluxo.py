@@ -103,6 +103,9 @@ st.markdown(
       .calendar-day.negative {{ background:linear-gradient(180deg,#FFF 0%,#FFF2F2 100%); }}
       .calendar-day.warning {{ background:linear-gradient(180deg,#FFF 0%,#FFF9E9 100%); }}
       .calendar-day.positive {{ background:linear-gradient(180deg,#FFF 0%,#F0FBF4 100%); }}
+      .calendar-day.entry-focus {{ background:linear-gradient(180deg,#FFF 0%,#EFF6FF 100%); }}
+      .calendar-day.exit-focus {{ background:linear-gradient(180deg,#FFF 0%,#FFF1F2 100%); }}
+      .calendar-day.selected-range {{ box-shadow:inset 0 0 0 3px #64748B; z-index:1; }}
       .calendar-date {{ font-size:.91rem; font-weight:900; color:#0F172A; margin-bottom:13px; display:flex; align-items:center; justify-content:space-between; }}
       .status-dot {{ width:9px; height:9px; border-radius:50%; display:inline-block; }}
       .dot-neg {{ background:#EF4444; }} .dot-warn {{ background:#F59E0B; }} .dot-pos {{ background:#16A34A; }}
@@ -595,6 +598,90 @@ def kpi_card(label: str, value: str, note: str, css_class: str) -> None:
     )
 
 
+def render_financial_calendar(
+    month_period: pd.Period,
+    day_values: dict[int, dict[str, float]],
+    mode: str = "finance",
+    selected_start: date | None = None,
+    selected_end: date | None = None,
+) -> None:
+    """Renderiza o mesmo calendário executivo para entradas, saídas e visão geral."""
+    import calendar as _calendar
+
+    weeks = _calendar.Calendar(firstweekday=0).monthdayscalendar(
+        month_period.year, month_period.month
+    )
+    html = ['<div class="calendar-wrap"><div class="calendar-grid">']
+    for name in ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]:
+        html.append(f'<div class="calendar-head">{name}</div>')
+
+    for week in weeks:
+        for day_number in week:
+            if not day_number:
+                html.append('<div class="calendar-day empty"></div>')
+                continue
+
+            current_date = date(month_period.year, month_period.month, day_number)
+            values = day_values.get(day_number, {})
+            entries = float(values.get("Entradas", 0.0))
+            overdue = float(values.get("Atraso", 0.0))
+            exits = float(values.get("Saídas", 0.0))
+            balance = values.get("Saldo")
+
+            selected = bool(
+                selected_start and selected_end
+                and selected_start <= current_date <= selected_end
+            )
+            if mode == "entries":
+                state_class = "entry-focus"
+                dot_class = "dot-warn" if overdue else "dot-pos"
+            elif mode == "exits":
+                state_class = "exit-focus"
+                dot_class = "dot-neg" if exits else "dot-pos"
+            elif balance is not None and float(balance) < 0:
+                state_class, dot_class = "negative", "dot-neg"
+            elif balance is not None and minimum_cash > 0 and float(balance) < minimum_cash:
+                state_class, dot_class = "warning", "dot-warn"
+            else:
+                state_class, dot_class = "positive", "dot-pos"
+
+            if selected:
+                state_class += " selected-range"
+
+            lines: list[str] = []
+            if mode in {"finance", "entries"}:
+                lines.append(
+                    f'<div class="calendar-line"><span>Entradas</span>'
+                    f'<b class="calendar-in">{money_br(entries)}</b></div>'
+                )
+                lines.append(
+                    f'<div class="calendar-line"><span>Em atraso</span>'
+                    f'<b style="color:{WARNING}">{money_br(overdue)}</b></div>'
+                )
+            if mode in {"finance", "exits"}:
+                lines.append(
+                    f'<div class="calendar-line"><span>Saídas</span>'
+                    f'<b class="calendar-out">{money_br(exits)}</b></div>'
+                )
+            if mode == "finance" and balance is not None:
+                lines.append(
+                    f'<div class="calendar-line"><span>Saldo</span>'
+                    f'<b class="calendar-balance {"negative" if float(balance) < 0 else ""}">'
+                    f'{money_br(float(balance))}</b></div>'
+                )
+
+            html.append(
+                f'<div class="calendar-day {state_class}">'
+                f'<div class="calendar-date"><span>{day_number:02d}</span>'
+                f'<span class="status-dot {dot_class}"></span></div>'
+                + "".join(lines)
+                + "</div>"
+            )
+
+    html.append("</div></div>")
+    st.markdown("".join(html), unsafe_allow_html=True)
+
+
 
 def render_fullscreen_image(image_b64: str, alt: str) -> None:
     """Exibe a imagem e permite abri-la em uma nova aba, em tamanho integral."""
@@ -849,8 +936,6 @@ if page == "Painel Executivo":
     i4.metric("Necessidade de caixa", money_br(cash_need))
 
 elif page == "Entradas":
-    import calendar as _calendar
-
     st.markdown('<div class="section-head"><h2>Gestão de entradas</h2><p>Recebimentos agrupados por cliente e visão líquida dos cartões.</p></div>', unsafe_allow_html=True)
     e1, e2, e3, e4 = st.columns(4)
     with e1: kpi_card("Recebimentos de clientes", money_br(customer_total), f"{filtered_raw[filtered_raw['Origem'].eq('Títulos a receber')]['Contraparte'].nunique()} clientes", "kpi-entry")
@@ -887,89 +972,60 @@ elif page == "Entradas":
             Atrasado=("Valor", lambda values: float(values[month_receivables.loc[values.index, "Em atraso"]].sum())),
         ).to_dict("index")
 
-        receivable_selection_key = f"receivable_selected_dates_{selected_receivable_month}"
-        if receivable_selection_key not in st.session_state:
-            st.session_state[receivable_selection_key] = []
-        selected_receivable_dates = list(st.session_state[receivable_selection_key])
-
-        clear_rec, hint_rec = st.columns([0.8, 3.2])
-        with clear_rec:
-            if st.button("Limpar seleção", key="clear_receivable_dates", use_container_width=True, disabled=not selected_receivable_dates):
-                st.session_state[receivable_selection_key] = []
-                st.rerun()
-        with hint_rec:
-            if len(selected_receivable_dates) == 1:
-                st.info(f"Dia selecionado: {pd.Timestamp(selected_receivable_dates[0]):%d/%m/%Y}. Clique em outro dia para formar um período.")
-            elif len(selected_receivable_dates) == 2:
-                st.info(
-                    f"Período selecionado: {pd.Timestamp(min(selected_receivable_dates)):%d/%m/%Y} "
-                    f"a {pd.Timestamp(max(selected_receivable_dates)):%d/%m/%Y}."
-                )
-            else:
-                st.caption("Nenhuma data selecionada: os indicadores consideram todo o mês exibido.")
-
-        st.markdown(
-            """<style>
-            .st-key-receivable_calendar [data-testid="stButton"] button {
-                min-height: 112px; white-space: pre-line; border-radius: 12px;
-                border: 1px solid #DCE4EF; font-weight: 750; line-height: 1.45;
-                box-shadow: 0 3px 10px rgba(15, 23, 42, .05);
-            }
-            </style>""",
-            unsafe_allow_html=True,
+        month_start = selected_receivable_month.start_time.date()
+        month_end_date = selected_receivable_month.end_time.date()
+        filter_receivable_period = st.toggle(
+            "Selecionar um período específico",
+            value=False,
+            key=f"filter_receivable_period_{selected_receivable_month}",
         )
-        with st.container(key="receivable_calendar"):
-            rec_header = st.columns(7)
-            for column, label in zip(rec_header, ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]):
-                column.markdown(f"<div style='text-align:center;font-weight:800;color:{MUTED}'>{label}</div>", unsafe_allow_html=True)
-            rec_weeks = _calendar.Calendar(firstweekday=0).monthdayscalendar(
-                selected_receivable_month.year, selected_receivable_month.month
+        if filter_receivable_period:
+            selected_receivable_range = st.date_input(
+                "Período destacado na agenda",
+                value=(month_start, month_end_date),
+                min_value=month_start,
+                max_value=month_end_date,
+                format="DD/MM/YYYY",
+                key=f"receivable_range_{selected_receivable_month}",
             )
-            for week in rec_weeks:
-                rec_columns = st.columns(7)
-                for column, day_number in zip(rec_columns, week):
-                    if not day_number:
-                        column.markdown("<div style='height:112px'></div>", unsafe_allow_html=True)
-                        continue
-                    day_date = date(selected_receivable_month.year, selected_receivable_month.month, day_number)
-                    amounts = receivable_daily.get(day_number, {"Total": 0.0, "Atrasado": 0.0})
-                    total_day = float(amounts["Total"])
-                    overdue_day = float(amounts["Atrasado"])
-                    projected_day = total_day - overdue_day
-                    day_token = day_date.isoformat()
-                    is_selected = day_token in selected_receivable_dates
-                    label = (
-                        f"{'✓ ' if is_selected else ''}{day_number:02d}\n"
-                        f"Previsto {money_br(projected_day)}\n"
-                        f"Atrasado {money_br(overdue_day)}"
-                    )
-                    if column.button(
-                        label,
-                        key=f"receivable_day_{selected_receivable_month}_{day_number}",
-                        use_container_width=True,
-                        type="primary" if is_selected else "secondary",
-                    ):
-                        current = list(st.session_state[receivable_selection_key])
-                        if day_token in current:
-                            current.remove(day_token)
-                        elif len(current) >= 2:
-                            current = [day_token]
-                        else:
-                            current.append(day_token)
-                        st.session_state[receivable_selection_key] = sorted(current)
-                        st.rerun()
-
-        selected_receivable_dates = list(st.session_state[receivable_selection_key])
-        if selected_receivable_dates:
-            rec_start = pd.Timestamp(min(selected_receivable_dates))
-            rec_end = pd.Timestamp(max(selected_receivable_dates))
+            if isinstance(selected_receivable_range, (tuple, list)) and len(selected_receivable_range) == 2:
+                rec_start_date, rec_end_date = selected_receivable_range
+            elif isinstance(selected_receivable_range, (tuple, list)):
+                rec_start_date = rec_end_date = selected_receivable_range[0] if selected_receivable_range else month_start
+            else:
+                rec_start_date = rec_end_date = selected_receivable_range
+            rec_start, rec_end = pd.Timestamp(rec_start_date), pd.Timestamp(rec_end_date)
             receivable_scope = month_receivables[
                 month_receivables["Data"].dt.normalize().between(rec_start, rec_end)
             ].copy()
             rec_scope_note = f"{rec_start:%d/%m/%Y}" if rec_start == rec_end else f"{rec_start:%d/%m/%Y} a {rec_end:%d/%m/%Y}"
         else:
+            rec_start_date = rec_end_date = None
             receivable_scope = month_receivables.copy()
             rec_scope_note = selected_receivable_month.strftime("%m/%Y")
+
+        receivable_calendar_values: dict[int, dict[str, float]] = {}
+        for day_number, amounts in receivable_daily.items():
+            total_day = float(amounts["Total"])
+            overdue_day = float(amounts["Atrasado"])
+            receivable_calendar_values[int(day_number)] = {
+                "Entradas": total_day - overdue_day,
+                "Atraso": overdue_day,
+            }
+        render_financial_calendar(
+            selected_receivable_month,
+            receivable_calendar_values,
+            mode="entries",
+            selected_start=rec_start_date,
+            selected_end=rec_end_date,
+        )
+        st.markdown(
+            '<div class="legend-row">'
+            f'<div class="legend-item"><span class="status-dot" style="background:{ENTRY}"></span>Entradas previstas</div>'
+            f'<div class="legend-item"><span class="status-dot dot-warn"></span>Em atraso — fora do saldo</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
 
         scope_overdue = receivable_scope[receivable_scope["Em atraso"]]
         scope_projected = receivable_scope[~receivable_scope["Em atraso"]]
@@ -1037,9 +1093,7 @@ elif page == "Entradas":
         styled_table(card_detail, ["Valor líquido"], "Valor líquido", ENTRY, 440)
 
 elif page == "Saídas":
-    import calendar as _calendar
-
-    st.markdown('<div class="section-head"><h2>Agenda de saídas</h2><p>Clique em uma data para analisar o dia ou selecione duas datas para formar um período.</p></div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-head"><h2>Agenda de saídas</h2><p>Visualize os compromissos no calendário e, quando necessário, destaque um período específico para atualizar os indicadores.</p></div>', unsafe_allow_html=True)
     payable_raw = filtered_raw[filtered_raw["Natureza"].eq("Saída")].copy()
 
     payable_months = sorted(payable_raw["Data"].dt.to_period("M").unique())
@@ -1057,76 +1111,30 @@ elif page == "Saídas":
     ].copy()
     daily_payables = month_payables.groupby(month_payables["Data"].dt.day)["Valor"].sum().to_dict()
 
-    selection_key = f"payable_selected_dates_{selected_payable_month}"
-    if selection_key not in st.session_state:
-        st.session_state[selection_key] = []
-    selected_output_dates = list(st.session_state[selection_key])
-
-    clear_col, hint_col = st.columns([0.8, 3.2])
-    with clear_col:
-        if st.button("Limpar seleção", use_container_width=True, disabled=not selected_output_dates):
-            st.session_state[selection_key] = []
-            st.rerun()
-    with hint_col:
-        if len(selected_output_dates) == 1:
-            st.info(f"Dia selecionado: {pd.Timestamp(selected_output_dates[0]):%d/%m/%Y}. Clique em outro dia para fechar o período.")
-        elif len(selected_output_dates) == 2:
-            st.info(
-                f"Período selecionado: {pd.Timestamp(min(selected_output_dates)):%d/%m/%Y} "
-                f"a {pd.Timestamp(max(selected_output_dates)):%d/%m/%Y}."
-            )
-        else:
-            st.caption("Nenhuma data selecionada: os indicadores consideram todo o mês exibido.")
-
-    st.markdown(
-        """<style>
-        .st-key-payable_calendar [data-testid="stButton"] button {
-            min-height: 96px; white-space: pre-line; border-radius: 12px;
-            border: 1px solid #DCE4EF; font-weight: 750; line-height: 1.55;
-            box-shadow: 0 3px 10px rgba(15, 23, 42, .05);
-        }
-        </style>""",
-        unsafe_allow_html=True,
+    payable_month_start = selected_payable_month.start_time.date()
+    payable_month_end = selected_payable_month.end_time.date()
+    filter_payable_period = st.toggle(
+        "Selecionar um período específico",
+        value=False,
+        key=f"filter_payable_period_{selected_payable_month}",
     )
-    with st.container(key="payable_calendar"):
-        week_header = st.columns(7)
-        for column, label in zip(week_header, ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]):
-            column.markdown(f"<div style='text-align:center;font-weight:800;color:{MUTED}'>{label}</div>", unsafe_allow_html=True)
-
-        calendar_weeks = _calendar.Calendar(firstweekday=0).monthdayscalendar(
-            selected_payable_month.year, selected_payable_month.month
+    if filter_payable_period:
+        selected_payable_range = st.date_input(
+            "Período destacado na agenda",
+            value=(payable_month_start, payable_month_end),
+            min_value=payable_month_start,
+            max_value=payable_month_end,
+            format="DD/MM/YYYY",
+            key=f"payable_range_{selected_payable_month}",
         )
-        for week_index, week in enumerate(calendar_weeks):
-            week_columns = st.columns(7)
-            for column, day_number in zip(week_columns, week):
-                if not day_number:
-                    column.markdown("<div style='height:96px'></div>", unsafe_allow_html=True)
-                    continue
-                day_date = date(selected_payable_month.year, selected_payable_month.month, day_number)
-                day_value = float(daily_payables.get(day_number, 0.0))
-                is_selected = day_date.isoformat() in selected_output_dates
-                label = f"{'✓ ' if is_selected else ''}{day_number:02d}\nSaídas\n{money_br(day_value)}"
-                if column.button(
-                    label,
-                    key=f"payable_day_{selected_payable_month}_{day_number}",
-                    use_container_width=True,
-                    type="primary" if is_selected else "secondary",
-                ):
-                    current = list(st.session_state[selection_key])
-                    day_token = day_date.isoformat()
-                    if day_token in current:
-                        current.remove(day_token)
-                    elif len(current) >= 2:
-                        current = [day_token]
-                    else:
-                        current.append(day_token)
-                    st.session_state[selection_key] = sorted(current)
-                    st.rerun()
-
-    selected_output_dates = list(st.session_state[selection_key])
-    if selected_output_dates:
-        range_start = pd.Timestamp(min(selected_output_dates))
-        range_end = pd.Timestamp(max(selected_output_dates))
+        if isinstance(selected_payable_range, (tuple, list)) and len(selected_payable_range) == 2:
+            payable_start_date, payable_end_date = selected_payable_range
+        elif isinstance(selected_payable_range, (tuple, list)):
+            payable_start_date = payable_end_date = selected_payable_range[0] if selected_payable_range else payable_month_start
+        else:
+            payable_start_date = payable_end_date = selected_payable_range
+        range_start = pd.Timestamp(payable_start_date)
+        range_end = pd.Timestamp(payable_end_date)
         payable_scope = month_payables[
             month_payables["Data"].dt.normalize().between(range_start, range_end)
         ].copy()
@@ -1136,8 +1144,28 @@ elif page == "Saídas":
             else f"{range_start:%d/%m/%Y} a {range_end:%d/%m/%Y}"
         )
     else:
+        payable_start_date = payable_end_date = None
         payable_scope = month_payables.copy()
         scope_note = selected_payable_month.strftime("%m/%Y")
+
+    payable_calendar_values = {
+        int(day_number): {"Saídas": float(day_value)}
+        for day_number, day_value in daily_payables.items()
+    }
+    render_financial_calendar(
+        selected_payable_month,
+        payable_calendar_values,
+        mode="exits",
+        selected_start=payable_start_date,
+        selected_end=payable_end_date,
+    )
+    st.markdown(
+        '<div class="legend-row">'
+        f'<div class="legend-item"><span class="status-dot dot-neg"></span>Saídas programadas</div>'
+        '<div class="legend-item"><span style="width:13px;height:13px;border:2px solid #64748B;display:inline-block"></span>Período selecionado</div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
 
     selected_outflows = float(payable_scope["Valor"].sum())
     supplier_group = payable_scope.groupby("Contraparte", as_index=False).agg(
@@ -1219,9 +1247,6 @@ elif page == "Agenda Financeira":
     with c5: kpi_card("Em atraso no mês", money_br(month_overdue_total), "Visível para cobrança · fora do saldo", "kpi-neutral")
 
     st.markdown("<br>", unsafe_allow_html=True)
-    year, month = selected_month.year, selected_month.month
-    cal = _calendar.Calendar(firstweekday=0)
-    weeks = cal.monthdayscalendar(year, month)
     by_day = {row["Período"].day: row for _, row in month_data.iterrows()}
     overdue_by_day = month_overdue.groupby(month_overdue["Data"].dt.day)["Valor"].sum().to_dict()
     previous_balance = opening_balance
@@ -1231,39 +1256,20 @@ elif page == "Agenda Financeira":
         if not previous_rows.empty:
             previous_balance = float(previous_rows.iloc[-1]["Saldo Projetado"])
 
-    html = ['<div class="calendar-wrap"><div class="calendar-grid">']
-    for name in ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]:
-        html.append(f'<div class="calendar-head">{name}</div>')
     running_balance = previous_balance
-    for week in weeks:
-        for day in week:
-            if day == 0:
-                html.append('<div class="calendar-day empty"></div>')
-                continue
-            row = by_day.get(day)
-            ent = float(row["Entradas"]) if row is not None else 0.0
-            sai = float(row["Saídas"]) if row is not None else 0.0
-            atrasado = float(overdue_by_day.get(day, 0.0))
-            if row is not None:
-                running_balance = float(row["Saldo Projetado"])
-            saldo = running_balance
-            if saldo < 0:
-                state_cls, dot_cls = "negative", "dot-neg"
-            elif minimum_cash > 0 and saldo < minimum_cash:
-                state_cls, dot_cls = "warning", "dot-warn"
-            else:
-                state_cls, dot_cls = "positive", "dot-pos"
-            html.append(
-                f'<div class="calendar-day {state_cls}">'
-                f'<div class="calendar-date"><span>{day:02d}</span><span class="status-dot {dot_cls}"></span></div>'
-                f'<div class="calendar-line"><span>Entradas</span><b class="calendar-in">{money_br(ent)}</b></div>'
-                f'<div class="calendar-line"><span>Em atraso</span><b style="color:{WARNING}">{money_br(atrasado)}</b></div>'
-                f'<div class="calendar-line"><span>Saídas</span><b class="calendar-out">{money_br(sai)}</b></div>'
-                f'<div class="calendar-line"><span>Saldo</span><b class="calendar-balance {"negative" if saldo < 0 else ""}">{money_br(saldo)}</b></div>'
-                '</div>'
-            )
-    html.append('</div></div>')
-    st.markdown(''.join(html), unsafe_allow_html=True)
+    finance_calendar_values: dict[int, dict[str, float]] = {}
+    days_in_month = _calendar.monthrange(selected_month.year, selected_month.month)[1]
+    for day_number in range(1, days_in_month + 1):
+        row = by_day.get(day_number)
+        if row is not None:
+            running_balance = float(row["Saldo Projetado"])
+        finance_calendar_values[day_number] = {
+            "Entradas": float(row["Entradas"]) if row is not None else 0.0,
+            "Atraso": float(overdue_by_day.get(day_number, 0.0)),
+            "Saídas": float(row["Saídas"]) if row is not None else 0.0,
+            "Saldo": running_balance,
+        }
+    render_financial_calendar(selected_month, finance_calendar_values, mode="finance")
     st.markdown(
         '<div class="legend-row">'
         '<div class="legend-item"><span class="status-dot dot-neg"></span>Saldo negativo</div>'
